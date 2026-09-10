@@ -1,0 +1,581 @@
+% !TeX program = xelatex
+% Build: latexmk -xelatex -interaction=nonstopmode -halt-on-error -outdir=build report.tex
+% Standalone source; no external images or code files required.
+\documentclass[UTF8,11pt,a4paper,fontset=fandol]{ctexart}
+\usepackage[margin=2.25cm,top=2.15cm,bottom=2.15cm,headheight=15pt]{geometry}
+\usepackage[table]{xcolor}
+\usepackage{booktabs,longtable,array}
+\usepackage{listings}
+\usepackage{needspace}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning}
+\usepackage{fancyhdr}
+\usepackage[hidelinks]{hyperref}
+\usepackage{bookmark}
+\setmonofont{DejaVu Sans Mono}[Scale=0.82]
+\definecolor{Accent}{HTML}{234B69}
+\definecolor{CodeBG}{HTML}{F5F7F9}
+\definecolor{TableBG}{HTML}{E9EFF4}
+\definecolor{Muted}{HTML}{586774}
+\ctexset{
+ section={format=\Large\bfseries\color{Accent},beforeskip=1.0em,afterskip=0.5em},
+ subsection={format=\large\bfseries,beforeskip=0.8em,afterskip=0.4em},
+ subsubsection={format=\normalsize\bfseries,beforeskip=0.7em,afterskip=0.3em}}
+\setlength{\parskip}{0.12em}
+\setlength{\parindent}{2em}
+\linespread{1.03}
+\setlength{\emergencystretch}{2em}
+\raggedbottom
+\clubpenalty=10000
+\widowpenalty=10000
+\renewcommand{\arraystretch}{1.22}
+\setlength{\tabcolsep}{6pt}
+\setlength{\LTpre}{0.5em}
+\setlength{\LTpost}{0.5em}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\lstset{language=C,basicstyle=\ttfamily\small,keywordstyle=\bfseries\color{Accent},
+ commentstyle=\itshape\color{Muted},stringstyle=\color{Accent},
+ backgroundcolor=\color{CodeBG},frame=single,rulecolor=\color{TableBG},
+ framesep=5pt,tabsize=4,columns=fullflexible,keepspaces=true,showstringspaces=false,
+ breaklines=true,breakatwhitespace=false,aboveskip=0.4em,belowskip=0.4em}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small 计算机网络实验}
+\fancyhead[R]{\small HTTP/HTTPS 文件服务器}
+\fancyfoot[C]{\small\thepage}
+\renewcommand{\headrulewidth}{0.3pt}
+\hypersetup{pdftitle={Socket 编程实验报告：HTTP/HTTPS 文件服务器},pdfauthor={吴峥},pdfsubject={Socket、TLS 与 epoll 文件服务器实验}}
+\begin{document}
+\begin{center}
+{\LARGE\bfseries\color{Accent} Socket 编程实验报告\par}
+\vspace{0.3em}
+{\large HTTP/HTTPS 文件服务器\par}
+\vspace{0.5em}
+{\normalsize 姓名：吴峥\qquad 学号：2024K8009909013\par}
+\end{center}
+\vspace{0.3em}
+
+
+\Needspace{4\baselineskip}
+\section*{一、实验目标与完成情况}
+\addcontentsline{toc}{section}{一、实验目标与完成情况}
+
+本实验使用 C 语言和 Linux Socket 接口实现文件服务器，通过 OpenSSL 提供 HTTPS 通信，并使用非阻塞 I/O 与 \texttt{epoll} 管理多个客户端连接。服务器同时监听 HTTP 80 端口和 HTTPS 443 端口：HTTP 请求重定向到 HTTPS，HTTPS GET 请求处理，包含完成文件读取与响应，支持完整文件获取、文件不存在处理以及单段字节范围传输。
+
+
+本实验已通过线上验证。
+
+
+\Needspace{4\baselineskip}
+\section*{二、实验环境与整体结构}
+\addcontentsline{toc}{section}{二、实验环境与整体结构}
+
+\Needspace{4\baselineskip}
+\subsection*{2.1 实验环境}
+\addcontentsline{toc}{subsection}{2.1 实验环境}
+
+\Needspace{4\baselineskip}
+{\small
+\begin{longtable}{@{}L{\dimexpr 0.40\textwidth-6.0pt\relax}L{\dimexpr 0.60\textwidth-6.0pt\relax}@{}}
+\toprule
+\rowcolor{TableBG}
+\textbf{组成} & \textbf{本实验使用的配置} \\
+\midrule
+\endfirsthead
+\toprule
+\rowcolor{TableBG}
+\textbf{组成} & \textbf{本实验使用的配置} \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+
+运行环境 & WSL2 \\
+
+编程语言与编译工具 & C、GCC、Make \\
+
+网络与加密接口 & Linux Socket、\texttt{epoll}、OpenSSL \\
+
+实验网络 & Mininet，两个主机与一个 OVS 交换机 \\
+
+服务端 & \texttt{h1}，地址 \texttt{10.0.0.1}，监听 80、443 端口 \\
+
+客户端 & \texttt{h2}，地址 \texttt{10.0.0.2}，使用 Python Requests 发起样例请求 \\
+
+\end{longtable}
+}
+
+\texttt{topo.py} 中的网络拓扑为：
+
+
+\begin{center}
+\begin{tikzpicture}[box/.style={draw=Accent,rounded corners=2pt,fill=CodeBG,align=center,minimum height=1cm,font=\small}]
+\node[box] (client) at (0,0) {h2：客户端\\10.0.0.2};
+\node[box,minimum width=1.8cm] (sw) at (4.3,0) {s1};
+\node[box] (server) at (8.6,0) {h1：服务器\\10.0.0.1};
+\draw[thick] (client)--(sw);
+\draw[thick] (sw)--node[above=7pt,font=\footnotesize]{100 Mbit/s，10 ms}(server);
+\end{tikzpicture}
+\end{center}
+
+其中，\texttt{h1} 与 \texttt{s1} 之间的链路配置为 \texttt{bw=100}、\texttt{delay='10ms'}，即带宽参数为 100 Mbit/s、时延参数为 10 ms。
+
+
+\Needspace{4\baselineskip}
+\subsection*{2.2 请求处理流程}
+\addcontentsline{toc}{subsection}{2.2 请求处理流程}
+
+HTTP 与 HTTPS 共用连接管理和响应发送框架，区别在于 HTTPS 需要先完成 TLS 握手，并通过 OpenSSL 读写加密数据。
+
+
+\begin{center}
+\begin{tikzpicture}[box/.style={draw=Accent,rounded corners=2pt,fill=CodeBG,align=center,font=\small,minimum height=0.65cm,inner sep=5pt},arr/.style={-{Stealth[length=2mm]},color=Accent}]
+\node[box] (tcp) at (0,0) {建立 TCP 连接};
+\node[box] (http) at (-3.7,-1.05) {HTTP：直接读取请求};
+\node[box] (https) at (2.7,-1.05) {HTTPS：TLS 握手后读取请求};
+\node[box] (redirect) at (-3.7,-2.2) {301：返回 HTTPS 地址};
+\node[box] (missing) at (0,-2.2) {404：文件不存在};
+\node[box] (full) at (3.2,-2.2) {200：完整文件};
+\node[box] (range) at (6.3,-2.2) {206：单段 Range};
+\node[box] (close) at (0.7,-3.4) {发送完响应后关闭连接并释放资源};
+\draw[arr] (tcp)--(http); \draw[arr] (tcp)--(https);
+\draw[arr] (http)--(redirect);
+\draw[arr] (https)--(missing); \draw[arr] (https)--(full); \draw[arr] (https)--(range);
+\draw[arr] (redirect)|-(close); \draw[arr] (missing)--(close);
+\draw[arr] (full)--(close); \draw[arr] (range)|-(close);
+\end{tikzpicture}
+\end{center}
+
+每个连接独立保存请求缓冲区、响应缓冲区、发送进度、文件偏移和剩余文件长度。因此，一个连接等待网络数据时，其他已经就绪的连接仍可继续处理。
+
+
+\Needspace{4\baselineskip}
+\subsection*{2.3 核心数据结构}
+\addcontentsline{toc}{subsection}{2.3 核心数据结构}
+
+程序使用两个结构体，分别表示一次请求的解析结果和一个连接的完整处理上下文，定义如下：
+
+
+\Needspace{90pt}
+\noindent\begin{minipage}{\linewidth}
+\begin{lstlisting}
+struct http_request
+{
+	char *method;
+	char *target;
+	char *range;
+	int if_range;
+};
+\end{lstlisting}
+\end{minipage}
+\par
+
+\Needspace{140pt}
+\noindent\begin{minipage}{\linewidth}
+\begin{lstlisting}
+struct connection
+{
+	int fd, tls;
+	SSL *ssl;
+	enum state state;
+	char input[4096];
+	char output[8192];
+	size_t used, sent, output_len;
+	/* output holds the response header, then successive file chunks. */
+	int file_fd;
+	off_t file_offset, file_remaining;
+};
+\end{lstlisting}
+\end{minipage}
+\par
+
+\texttt{http\_\allowbreak{}request} 是 \texttt{build\_\allowbreak{}response(\allowbreak{})\allowbreak{}} 内部的临时对象。\texttt{method}、\texttt{target} 和 \texttt{range} 都指向输入缓冲区中已切分的字符串；\texttt{if\_\allowbreak{}range} 记录请求是否包含 \texttt{If-Range} 条件。本实现不验证该条件对应的资源版本，而是回退为完整文件响应。
+
+
+\texttt{connection} 则跨多次事件保留，直到连接结束才释放。各组字段分工如下：
+
+
+\Needspace{4\baselineskip}
+{\small
+\begin{longtable}{@{}L{\dimexpr 0.40\textwidth-6.0pt\relax}L{\dimexpr 0.60\textwidth-6.0pt\relax}@{}}
+\toprule
+\rowcolor{TableBG}
+\textbf{字段} & \textbf{作用} \\
+\midrule
+\endfirsthead
+\toprule
+\rowcolor{TableBG}
+\textbf{字段} & \textbf{作用} \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+
+\texttt{fd}、\texttt{tls}、\texttt{ssl} & 保存套接字、是否使用 TLS 以及对应的 OpenSSL 连接对象 \\
+
+\texttt{state} & 记录当前处于握手、读取、发送或关闭阶段；监听对象使用 \texttt{LISTENER} \\
+
+\texttt{input}、\texttt{used} & 保存已收到的请求数据及有效长度 \\
+
+\texttt{output}、\texttt{output\_\allowbreak{}len}、\texttt{sent} & 保存当前待发送的数据块、块长度和已发送长度 \\
+
+\texttt{file\_\allowbreak{}fd}、\texttt{file\_\allowbreak{}offset}、\texttt{file\_\allowbreak{}remaining} & 保存打开的文件、下一次读取位置及尚未读入缓冲区的字节数 \\
+
+\end{longtable}
+}
+
+这一划分使请求解析结果与连接运行状态各有归属：构造响应后不再需要保留 \texttt{http\_\allowbreak{}request}，但文件和网络的传输进度仍保存在 \texttt{connection} 中，供下一次事件继续使用。
+
+
+\Needspace{4\baselineskip}
+\subsection*{2.4 函数分工与调用关系}
+\addcontentsline{toc}{subsection}{2.4 函数分工与调用关系}
+
+\Needspace{4\baselineskip}
+{\small
+\begin{longtable}{@{}L{\dimexpr 0.40\textwidth-6.0pt\relax}L{\dimexpr 0.60\textwidth-6.0pt\relax}@{}}
+\toprule
+\rowcolor{TableBG}
+\textbf{函数} & \textbf{主要职责} \\
+\midrule
+\endfirsthead
+\toprule
+\rowcolor{TableBG}
+\textbf{函数} & \textbf{主要职责} \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+
+\texttt{main(\allowbreak{})\allowbreak{}} & 初始化 TLS、建立双端口监听，运行 \texttt{epoll\_\allowbreak{}wait(\allowbreak{})\allowbreak{}} 主循环并分派事件 \\
+
+\texttt{make\_\allowbreak{}listener(\allowbreak{})\allowbreak{}}、\texttt{nonblock(\allowbreak{})\allowbreak{}} & 创建监听套接字、设置地址复用与非阻塞模式，完成绑定和监听 \\
+
+\texttt{accept\_\allowbreak{}clients(\allowbreak{})\allowbreak{}} & 接收连接，分配 \texttt{connection}，按需创建 \texttt{SSL} 对象，注册事件并首次调用 \texttt{drive(\allowbreak{})\allowbreak{}} \\
+
+\texttt{drive(\allowbreak{})\allowbreak{}} & 执行连接状态机，协调握手、请求读取、响应发送和关闭 \\
+
+\texttt{watch(\allowbreak{})\allowbreak{}}、\texttt{tls\_\allowbreak{}wait(\allowbreak{})\allowbreak{}} & 注册或修改关注的事件；将 TLS 的等待状态转换为读写事件 \\
+
+\texttt{parse\_\allowbreak{}request(\allowbreak{})\allowbreak{}}、\texttt{is\_\allowbreak{}token(\allowbreak{})\allowbreak{}} & 切分并检查 HTTP 请求行、首部字段，提取请求信息 \\
+
+\texttt{build\_\allowbreak{}response(\allowbreak{})\allowbreak{}}、\texttt{empty\_\allowbreak{}response(\allowbreak{})\allowbreak{}} & 根据请求决定状态码和响应首部，初始化文件发送范围；统一生成无正文响应 \\
+
+\texttt{open\_\allowbreak{}local\_\allowbreak{}file(\allowbreak{})\allowbreak{}}、\texttt{hex\_\allowbreak{}value(\allowbreak{})\allowbreak{}} & 解码 URL 路径并逐级打开本地文件 \\
+
+\texttt{select\_\allowbreak{}range(\allowbreak{})\allowbreak{}}、\texttt{parse\_\allowbreak{}decimal(\allowbreak{})\allowbreak{}} & 解析字节范围和数值，计算文件起点、长度及边界结果 \\
+
+\texttt{content\_\allowbreak{}type(\allowbreak{})\allowbreak{}}、\texttt{read\_\allowbreak{}file\_\allowbreak{}chunk(\allowbreak{})\allowbreak{}} & 选择响应类型，按当前文件偏移读取下一块数据 \\
+
+\texttt{drop(\allowbreak{})\allowbreak{}}、\texttt{die(\allowbreak{})\allowbreak{}} & 分别负责单连接资源清理和程序级致命错误退出 \\
+
+\end{longtable}
+}
+
+\begingroup\raggedright
+主要调用关系是 \texttt{main(\allowbreak{})\allowbreak{} \ensuremath{\rightarrow} accept\_\allowbreak{}clients(\allowbreak{})\allowbreak{}/\allowbreak{}drive(\allowbreak{})\allowbreak{} \ensuremath{\rightarrow} build\_\allowbreak{}response(\allowbreak{})\allowbreak{} \ensuremath{\rightarrow} parse\_\allowbreak{}request(\allowbreak{})\allowbreak{}/\allowbreak{}open\_\allowbreak{}local\_\allowbreak{}file(\allowbreak{})\allowbreak{}/\allowbreak{}select\_\allowbreak{}range(\allowbreak{})\allowbreak{}}。其中，\texttt{build\_\allowbreak{}response(\allowbreak{})\allowbreak{}} 负责确定“返回什么”，\texttt{drive(\allowbreak{})\allowbreak{}} 负责推进“何时读写、已经传输了多少”；响应构造完成后，\texttt{drive(\allowbreak{})\allowbreak{}} 再按需调用 \texttt{read\_\allowbreak{}file\_\allowbreak{}chunk(\allowbreak{})\allowbreak{}} 读取文件。
+\par\endgroup
+
+
+\Needspace{4\baselineskip}
+\section*{三、分阶段实现}
+\addcontentsline{toc}{section}{三、分阶段实现}
+
+\Needspace{4\baselineskip}
+\subsection*{3.0 AI 辅助说明}
+\addcontentsline{toc}{subsection}{3.0 AI 辅助说明}
+
+网络协议和事实标准实在复杂，包括 epoll 的使用也并不轻松。本次实验大量使用 AI 辅助纠错以及处理边界，实在节省不少纠错的功夫，程序鲁棒性也大幅增强。
+
+
+\Needspace{4\baselineskip}
+\subsection*{3.1 建立双端口服务与 TLS 通道}
+\addcontentsline{toc}{subsection}{3.1 建立双端口服务与 TLS 通道}
+
+服务器使用 \texttt{socket(\allowbreak{})\allowbreak{}} 创建 TCP 套接字，经 \texttt{bind(\allowbreak{})\allowbreak{}} 绑定端口后调用 \texttt{listen(\allowbreak{})\allowbreak{}} 进入监听状态。80 和 443 端口分别对应一个监听对象，并始终保留在事件循环中。通过 \texttt{SO\_\allowbreak{}REUSEADDR} 支持服务重启后的地址复用，监听套接字和接收得到的客户端套接字均设置为非阻塞模式。
+
+
+TLS 初始化使用 \texttt{TLS\_\allowbreak{}server\_\allowbreak{}method(\allowbreak{})\allowbreak{}} 创建服务端上下文，随后加载证书和私钥，并检查二者是否匹配。每个 HTTPS 连接创建独立的 \texttt{SSL} 对象，通过 \texttt{SSL\_\allowbreak{}set\_\allowbreak{}fd(\allowbreak{})\allowbreak{}} 关联底层 TCP 套接字。
+
+
+非阻塞模式下，握手不一定能在一次调用中完成。程序根据 OpenSSL 返回的状态等待后续读写事件，握手成功后才进入 HTTP 请求读取阶段。这样，尚未完成握手的客户端不会使整个服务器停在 \texttt{SSL\_\allowbreak{}accept(\allowbreak{})\allowbreak{}} 中。
+
+
+\Needspace{4\baselineskip}
+\subsection*{3.2 用状态机与 epoll 管理连接}
+\addcontentsline{toc}{subsection}{3.2 用状态机与 epoll 管理连接}
+
+程序采用单线程事件循环，以 \texttt{epoll} 的水平触发模式管理监听套接字和客户端连接。连接状态分为五类：
+
+
+\Needspace{4\baselineskip}
+{\small
+\begin{longtable}{@{}L{\dimexpr 0.25\textwidth-8.0pt\relax}L{\dimexpr 0.37\textwidth-8.0pt\relax}L{\dimexpr 0.38\textwidth-8.0pt\relax}@{}}
+\toprule
+\rowcolor{TableBG}
+\textbf{状态} & \textbf{处理内容} & \textbf{后续状态或动作} \\
+\midrule
+\endfirsthead
+\toprule
+\rowcolor{TableBG}
+\textbf{状态} & \textbf{处理内容} & \textbf{后续状态或动作} \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+
+\texttt{LISTENER} & 接收新连接 & 为新连接建立独立对象 \\
+
+\texttt{HANDSHAKE} & 推进 TLS 握手 & 成功后进入 \texttt{READING} \\
+
+\texttt{READING} & 累积请求头并解析 & 构造响应后进入 \texttt{WRITING} \\
+
+\texttt{WRITING} & 发送响应头和文件数据 & 全部发送后进入 \texttt{CLOSING} \\
+
+\texttt{CLOSING} & 发送 TLS 关闭通知并结束连接 & 释放文件、套接字和连接对象 \\
+
+\end{longtable}
+}
+
+事件循环通过 \texttt{epoll\_\allowbreak{}event.data.ptr} 找到相应连接，再由 \texttt{drive(\allowbreak{})\allowbreak{}} 推进其状态。遇到暂时无法完成的 I/O 时，记录已有进度并返回事件循环。
+
+
+\Needspace{275pt}
+\subsubsection*{（1）主事件循环：分派就绪连接}
+\addcontentsline{toc}{subsubsection}{（1）主事件循环：分派就绪连接}
+
+完成 TLS 初始化并把两个监听对象注册到 \texttt{epoll} 后，\texttt{main(\allowbreak{})\allowbreak{}} 执行以下主循环，原代码如下：
+
+
+\Needspace{210pt}
+\noindent\begin{minipage}{\linewidth}
+\begin{lstlisting}
+struct epoll_event events[64];
+while (1)
+{
+	int count = epoll_wait(ep, events, 64, -1);
+	if (count < 0)
+	{
+		if (errno == EINTR)
+			continue;
+		die("epoll_wait");
+	}
+	for (int i = 0; i < count; ++i)
+	{
+		struct connection *c = events[i].data.ptr;
+		if (c->state == LISTENER)
+			accept_clients(ep, c, ctx);
+		else if (drive(ep, c) < 0)
+			drop(ep, c);
+	}
+}
+\end{lstlisting}
+\end{minipage}
+\par
+
+\texttt{epoll\_\allowbreak{}wait(\allowbreak{})\allowbreak{}} 在没有事件时等待，每次最多返回 64 个就绪对象。监听对象交给 \texttt{accept\_\allowbreak{}clients(\allowbreak{})\allowbreak{}}，已建立的连接交给 \texttt{drive(\allowbreak{})\allowbreak{}}。\texttt{drive(\allowbreak{})\allowbreak{}} 返回 \texttt{0} 表示保留连接并等待后续事件，返回 \texttt{-1} 表示连接已结束或发生不可恢复的错误，两种结束情况均由 \texttt{drop(\allowbreak{})\allowbreak{}} 统一清理。
+
+
+\Needspace{4\baselineskip}
+\subsubsection*{（2）连接状态机：推进一次请求}
+\addcontentsline{toc}{subsubsection}{（2）连接状态机：推进一次请求}
+
+\texttt{drive(\allowbreak{})\allowbreak{}} 内部用 \texttt{for (\allowbreak{};;)\allowbreak{}} 包围 \texttt{switch (\allowbreak{}c->state)\allowbreak{}}：握手成功后进入读取状态，请求头完整后调用 \texttt{build\_\allowbreak{}response(\allowbreak{})\allowbreak{}} 并进入发送状态，响应全部发出后进入关闭状态。\texttt{break} 只退出 \texttt{switch}，因此可以立即推进下一状态；需要等待 I/O 时通过 \texttt{return} 交还控制权。以发送阶段的关键转移为例，原代码如下：
+
+
+\Needspace{110pt}
+\noindent\begin{minipage}{\linewidth}
+\begin{lstlisting}
+left = c->output_len - c->sent;
+if (left == 0)
+{
+	if (c->file_remaining == 0)
+		c->state = CLOSING;
+	else if (read_file_chunk(c) < 0)
+		return -1;
+	break;
+}
+\end{lstlisting}
+\end{minipage}
+\par
+
+当前缓冲区发完后，若文件还有剩余内容便读取下一块，否则进入 \texttt{CLOSING}；缓冲区仍有数据时则继续调用 \texttt{SSL\_\allowbreak{}write(\allowbreak{})\allowbreak{}} 或 \texttt{send(\allowbreak{})\allowbreak{}}。这样，响应头、文件数据和连接关闭由同一个控制循环衔接。
+新连接由 \texttt{calloc(\allowbreak{})\allowbreak{}} 分配并清零，HTTP 连接直接进入 \texttt{READING}，HTTPS 连接从 \texttt{HANDSHAKE} 开始。水平触发保证尚未处理完的就绪条件仍会继续通知。
+
+
+\Needspace{4\baselineskip}
+\subsubsection*{（3）等待事件与资源回收}
+\addcontentsline{toc}{subsubsection}{（3）等待事件与资源回收}
+
+TLS 的“暂时不可读写”由以下原代码处理：
+
+
+\Needspace{80pt}
+\noindent\begin{minipage}{\linewidth}
+\begin{lstlisting}
+int error = SSL_get_error(c->ssl, ret);
+if (error == SSL_ERROR_WANT_READ)
+	return watch(ep, EPOLL_CTL_MOD, c, EPOLLIN);
+if (error == SSL_ERROR_WANT_WRITE)
+	return watch(ep, EPOLL_CTL_MOD, c, EPOLLOUT);
+return -1;
+\end{lstlisting}
+\end{minipage}
+\par
+
+这里按 TLS 层实际需要的事件调整监听方向。普通 Socket 的 \texttt{EAGAIN}、\texttt{EWOULDBLOCK} 也采用类似处理；遇到 \texttt{EINTR} 则重试。
+
+
+此外，每次处理监听事件最多接收 64 个连接，每次推进连接累计发送达到 64 KiB 后让出执行机会，以避免连接接收或大文件发送长期占用事件循环。这些机制用于支持连接间交替推进。
+
+
+连接结束时统一调用 \texttt{drop(\allowbreak{})\allowbreak{}}：先从 \texttt{epoll} 中移除套接字，再释放 \texttt{SSL} 对象、关闭文件和连接描述符，最后释放连接结构体。文件描述符初始化为 \texttt{-1}，用于区分尚未打开文件的连接，避免清理时误关闭其他描述符。
+
+
+\Needspace{4\baselineskip}
+\subsection*{3.3 解析 HTTP 请求并返回文件}
+\addcontentsline{toc}{subsection}{3.3 解析 HTTP 请求并返回文件}
+
+\Needspace{4\baselineskip}
+\subsubsection*{（1）请求头的完整接收与解析}
+\addcontentsline{toc}{subsubsection}{（1）请求头的完整接收与解析}
+
+TCP 提供字节流，一次读取不一定得到完整 HTTP 请求。程序使用 4096 字节输入缓冲区累积数据，以 \texttt{\textbackslash{}r\textbackslash{}n\textbackslash{}r\textbackslash{}n} 判断请求头是否接收完整，并为字符串结束符保留空间。确认头部完整后，再解析方法、目标路径、HTTP 版本及各个首部字段。
+
+
+解析过程检查请求行格式和首部字段名，要求 HTTP/1.1 请求带有唯一且非空的 \texttt{Host}，并以不区分大小写的方式识别 \texttt{Range}、\texttt{If-Range} 等字段。格式错误返回 \texttt{400 Bad Request}；缓冲区耗尽而请求头仍未完整时返回 \texttt{431 Request Header Fields Too Large}。
+
+
+\texttt{parse\_\allowbreak{}request(\allowbreak{})\allowbreak{}} 直接在输入缓冲区内切分字符串：把请求行中的空格、首部行末的换行符和字段名后的冒号替换为字符串结束符，再用指针引用方法、路径和字段值。首部值两端的空格和制表符会被去除。这种处理无需为每个字段单独分配内存，而输入缓冲区在响应构造完成前始终有效。
+
+
+\Needspace{4\baselineskip}
+\subsubsection*{（2）HTTP 重定向}
+\addcontentsline{toc}{subsubsection}{（2）HTTP 重定向}
+
+通过格式检查的 HTTP 请求进入重定向分支，保留原路径和查询参数，以固定的 \texttt{https:/\allowbreak{}/\allowbreak{}10.0.0.1} 为目标地址。该分支不读取文件，因此不存在的文件路径也先重定向，再由 HTTPS 服务判断是否返回 404。
+
+
+重定向地址写入 \texttt{Location} 首部，再由 \texttt{empty\_\allowbreak{}response(\allowbreak{})\allowbreak{}} 统一生成状态行、\texttt{Content-Length: 0} 和 \texttt{Connection: close}。404 等无正文响应也复用该函数；正常文件响应则根据文件大小或选定范围单独填写正文长度。
+
+
+\Needspace{4\baselineskip}
+\subsubsection*{（3）HTTPS 文件响应与路径处理}
+\addcontentsline{toc}{subsubsection}{（3）HTTPS 文件响应与路径处理}
+
+HTTPS 文件服务支持 \texttt{GET}，其他方法返回 \texttt{405 Method Not Allowed}，并使用 \texttt{Allow: GET} 告知支持的方法。
+
+
+路径解析只取 URL 中查询参数之前的部分，并进行百分号解码。根路径 \texttt{/\allowbreak{}} 映射为 \texttt{index.html}，子目录文件则按路径逐级访问。程序拒绝 \texttt{..} 路径分量，使用 \texttt{openat(\allowbreak{})\allowbreak{}} 和 \texttt{O\_\allowbreak{}NOFOLLOW} 逐级打开路径，避免通过父目录跳转或符号链接访问工作目录之外的文件；最终通过 \texttt{fstat(\allowbreak{})\allowbreak{}} 确认目标为普通文件。目标不存在或不满足文件访问条件时，返回无正文的 404 响应。这部分完全是透过 AI 修改的代码才知道要防御 TOCTOU 。
+
+
+正常文件响应设置 \texttt{Content-Length}、\texttt{Content-Type}、\texttt{Accept-Ranges} 和 \texttt{Connection: close}。服务器每条连接处理一次请求，发送完成后关闭连接。
+
+
+文件内容不一次性载入内存，而是复用 8192 字节输出缓冲区，通过 \texttt{pread(\allowbreak{})\allowbreak{}} 从 \texttt{file\_\allowbreak{}offset} 指定的位置分块读取。每次成功读取后增加文件偏移、减少 \texttt{file\_\allowbreak{}remaining}，并设置当前块的 \texttt{output\_\allowbreak{}len}、将 \texttt{sent} 归零。只有当前块完全发送后才读取下一块，从而分别保存文件读取进度和网络发送进度。
+
+
+发送时，以 \texttt{output\_\allowbreak{}len - sent} 计算当前剩余长度，从 \texttt{output + sent} 继续写出，并仅按实际成功写入的字节数增加 \texttt{sent}。如果需要等待可写事件，缓冲区内容和发送位置保持不变，下一次从同一位置继续。响应头也先放入该缓冲区，完整发出后才装入第一块文件数据；只有缓冲区已发完且 \texttt{file\_\allowbreak{}remaining} 为零时，才进入关闭状态。
+
+
+\Needspace{4\baselineskip}
+\subsection*{3.4 第四阶段：实现 Range 分段传输}
+\addcontentsline{toc}{subsection}{3.4 第四阶段：实现 Range 分段传输}
+
+服务器在获取文件大小后，由 \texttt{select\_\allowbreak{}range(\allowbreak{})\allowbreak{}} 计算实际发送的起点和长度。没有范围请求时返回完整文件；有效单段范围返回 \texttt{206 Partial Content}，并增加 \texttt{Content-Range} 首部。
+
+
+\Needspace{4\baselineskip}
+{\small
+\begin{longtable}{@{}L{\dimexpr 0.40\textwidth-6.0pt\relax}L{\dimexpr 0.60\textwidth-6.0pt\relax}@{}}
+\toprule
+\rowcolor{TableBG}
+\textbf{请求形式} & \textbf{本实现的含义} \\
+\midrule
+\endfirsthead
+\toprule
+\rowcolor{TableBG}
+\textbf{请求形式} & \textbf{本实现的含义} \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+
+\texttt{bytes=a-b} & 返回从偏移 \texttt{a} 到 \texttt{b} 的字节，包含两个端点 \\
+
+\texttt{bytes=a-} & 从偏移 \texttt{a} 返回至文件末尾 \\
+
+\texttt{bytes=-n} & 返回文件最后 \texttt{n} 个字节 \\
+
+\end{longtable}
+}
+
+对于起止位置已经解析完成的范围，边界处理原代码如下：
+
+
+\Needspace{110pt}
+\noindent\begin{minipage}{\linewidth}
+\begin{lstlisting}
+if (end < start)
+	return 0;
+if (start >= size)
+	return -1;
+if (end >= size)
+	end = size - 1;
+*first = start;
+*length = end - start + 1;
+return 1;
+\end{lstlisting}
+\end{minipage}
+\par
+
+函数返回 \texttt{0} 表示忽略该范围并发送完整文件，返回 \texttt{-1} 表示范围无法满足，返回 \texttt{1} 表示生成部分内容响应。结束位置超过文件末尾时，截断到最后一个字节；起点已超出文件时，返回 \texttt{416 Range Not Satisfiable} 和 \texttt{Content-Range: bytes */\allowbreak{}文件大小}。
+
+
+以本实验 48,957 字节的文件为例：
+
+
+\Needspace{4\baselineskip}
+{\small
+\begin{longtable}{@{}L{\dimexpr 0.25\textwidth-8.0pt\relax}L{\dimexpr 0.37\textwidth-8.0pt\relax}L{\dimexpr 0.38\textwidth-8.0pt\relax}@{}}
+\toprule
+\rowcolor{TableBG}
+\textbf{Range 请求} & \textbf{Content-Range} & \textbf{正文长度} \\
+\midrule
+\endfirsthead
+\toprule
+\rowcolor{TableBG}
+\textbf{Range 请求} & \textbf{Content-Range} & \textbf{正文长度} \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+
+\texttt{bytes=100-200} & \texttt{bytes 100-200/\allowbreak{}48957} & 101 字节 \\
+
+\texttt{bytes=100-} & \texttt{bytes 100-48956/\allowbreak{}48957} & 48,857 字节 \\
+
+\end{longtable}
+}
+
+计算得到的起点和长度分别写入 \texttt{file\_\allowbreak{}offset} 与 \texttt{file\_\allowbreak{}remaining}，使完整文件和部分文件共用同一套输出逻辑。每次读取的字节数取缓冲区容量与剩余长度的较小值，因此范围末尾即使位于文件中间，也不会继续发送该范围之外的内容。
+
+
+本实现对多个范围、重复的 \texttt{Range} 首部以及带有未验证 \texttt{If-Range} 条件的请求回退为完整的 200 响应，不生成多段 \texttt{multipart/\allowbreak{}byteranges} 响应。范围数值解析使用溢出饱和处理，避免过大的十进制数发生整数回绕。
+
+
+\Needspace{4\baselineskip}
+\section*{四、实验结果与分析}
+\addcontentsline{toc}{section}{四、实验结果与分析}
+
+线上验证已通过。
+
+
+\Needspace{4\baselineskip}
+\section*{五、实验总结}
+\addcontentsline{toc}{section}{五、实验总结}
+
+本实验完成了同时提供 HTTP 重定向和 HTTPS 文件访问的 Socket 服务器，并通过线上验证。实现以非阻塞连接状态机为基础，将 TCP 连接、TLS 握手、HTTP 解析和文件发送组织在同一个 \texttt{epoll} 事件循环中；通过独立记录每条连接的读写进度，支持请求分段到达和文件分块发送；实现采用每连接一次请求的关闭策略，HTTPS 文件服务仅支持 GET 和单段范围传输。
+
+
+\end{document}
