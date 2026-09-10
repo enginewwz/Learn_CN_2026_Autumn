@@ -5,3 +5,4 @@ results*.csv
 sites.csv
 *.png
 build/
+keys/
