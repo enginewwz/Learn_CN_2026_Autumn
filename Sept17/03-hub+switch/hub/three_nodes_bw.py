@@ -59,6 +59,19 @@ if __name__ == '__main__':
     h3.cmd('ifconfig h3-eth0 10.0.0.3/8')
     clearIP(b1)
 
+    # Mininet hands out addresses in the order hosts are added, and it adds
+    # them sorted by name: [b1, h1, h2, h3].  So b1 is given 10.0.0.1 and
+    # every other host is shifted by one (h1 -> .2, h2 -> .3, h3 -> .4).
+    # The ifconfig/clearIP calls above only change the kernel; Mininet's own
+    # cached Intf.ip keeps that shifted assignment, and `pingall` pings
+    # dest.IP() -- i.e. the cache -- so it would test the wrong hosts
+    # (e.g. it would "ping b1" by pinging 10.0.0.1, which is really h1 pinging
+    # itself).  Re-read the addresses from the interfaces so the cache matches
+    # reality: h1/h2/h3 -> .1/.2/.3, b1 -> None.
+    for h in [ h1, h2, h3, b1 ]:
+        for iface in h.intfList():
+            iface.updateIP()
+
     for h in [ h1, h2, h3, b1 ]:
         h.cmd('./scripts/disable_offloading.sh')
         h.cmd('./scripts/disable_ipv6.sh')
