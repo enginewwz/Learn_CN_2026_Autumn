@@ -7,3 +7,4 @@ sites.csv
 build/
 keys/
 *.o
+.vscode/

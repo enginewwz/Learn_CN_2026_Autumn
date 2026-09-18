@@ -1,0 +1,74 @@
+{
+ "data": {
+  "hub": {
+   "A": {
+    "label": "流 1",
+    "rate": 5.85,
+    "transfer_mb": 21.3,
+    "sec": 30.4909
+   },
+   "A2": {
+    "label": "流 2",
+    "rate": 2.99,
+    "transfer_mb": 11.0,
+    "sec": 30.8921
+   },
+   "B": {
+    "label": "H2→H1",
+    "rate": 8.38,
+    "transfer_mb": 30.6,
+    "sec": 30.6453
+   },
+   "B2": {
+    "label": "H3→H1",
+    "rate": 8.26,
+    "transfer_mb": 30.4,
+    "sec": 30.8588
+   },
+   "sum_A": 8.84,
+   "sum_B": 16.64
+  },
+  "switch": {
+   "A": {
+    "label": "流 1",
+    "rate": 9.38,
+    "transfer_mb": 34.8,
+    "sec": 31.0876
+   },
+   "A2": {
+    "label": "流 2",
+    "rate": 9.4,
+    "transfer_mb": 35.0,
+    "sec": 31.2286
+   },
+   "B": {
+    "label": "H2→H1",
+    "rate": 9.29,
+    "transfer_mb": 34.4,
+    "sec": 31.0278
+   },
+   "B2": {
+    "label": "H3→H1",
+    "rate": 9.3,
+    "transfer_mb": 34.3,
+    "sec": 30.91
+   },
+   "sum_A": 18.78,
+   "sum_B": 18.59
+  }
+ },
+ "summary": {
+  "hub": {
+   "A": 8.84,
+   "B": 16.64
+  },
+  "switch": {
+   "A": 18.78,
+   "B": 18.59
+  },
+  "speedup_A": 2.1244343891402715,
+  "speedup_B": 1.1171875,
+  "hub_asymmetry": 1.8823529411764708,
+  "switch_asymmetry": 0.9898828541001065
+ }
+}

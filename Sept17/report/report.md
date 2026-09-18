@@ -1,0 +1,647 @@
+# 03 交换机转发实验报告：广播网络与交换机转发
+
+| 项目 | 内容 |
+| --- | --- |
+| 姓名 | 吴峥 |
+| 学号 | 2024K8009909013 |
+| 班级 | 2406 |
+| 实验日期 | 2026 年 9 月 17 日 |
+
+## 一、实验目的与完成情况
+
+本实验在 Mininet 提供的虚拟网络中，用 C 语言在用户态实现二层网络设备，共包含两个部分：
+
+1. **集线器（Hub）**：实现 `broadcast_packet()`，使节点具备“从任意接口收到帧后向其余所有接口复制转发”的广播能力；验证广播网络的连通性和转发效率，并自建环形拓扑观察广播帧在网络中形成环路、引发广播风暴的现象。
+2. **交换机（Switch）**：实现 MAC 地址表 `mac_port_map` 的全部操作（查找、插入、老化清除），并据此实现数据包的定向转发与未知单播广播，最后用 `iperf` 对比交换机转发与集线器广播的性能差异。
+
+两部分均已通过线上验证:
+
+![集线器线上验证结果](../03-hub+switch/hub/online_judge.png)
+
+![交换机线上验证结果](../03-hub+switch/switch/online_judge.png)
+
+## 二、实验环境与公共框架
+
+### 2.1 实验环境
+
+| 组成 | 本实验使用的配置 |
+| --- | --- |
+| 运行环境 | WSL 2（Windows Subsystem for Linux 2） |
+| Linux 发行版 | Ubuntu 24.04.5 LTS |
+| Linux 内核 | `6.18.33.2-microsoft-standard-WSL2`，x86-64 |
+| 编程语言与编译工具 | C、GCC、Make |
+| 网络虚拟化 | Mininet 2.3.0，`TCLink` 带带宽链路 |
+| 抓包与测量 | Wireshark / Dumpcap 4.2.2、`iperf`、`ping` |
+| 主机 CPU | Intel(R) Core(TM) i7-14650HX |
+
+### 2.2 用户态转发框架
+
+Hub 与 Switch 共用一套用户态转发框架：程序为每个名字形如 `*-eth*` 的接口打开一个 `AF_PACKET` / `SOCK_RAW` 套接字，用 `poll()` 等待任一接口可读，收到数据包后交给 `handle_packet()` 处理。核心数据结构如下：
+
+```c
+typedef struct {
+	struct list_head iface_list;	// the list of interfaces
+	int nifs;						// number of interfaces
+	struct pollfd *fds;				// structure used to poll packets among
+							        // all the interfaces
+} ustack_t;
+
+typedef struct {
+	struct list_head list;		// list node used to link all interfaces
+
+	int fd;						// file descriptor for receiving & sending packets
+	int index;					// the index (unique ID) of this interface
+	u8	mac[ETH_ALEN];			// mac address of this interface
+	char name[16];				// name of this interface
+} iface_info_t;
+```
+
+所有接口对象挂在全局 `instance->iface_list` 上，`iface->index` 是内核对接口的唯一编号。发送一个帧由 `iface_send_packet()` 完成，它把帧的目的 MAC 写入 `sockaddr_ll`，再通过 `sendto()` 从指定接口发出：
+
+```c
+void iface_send_packet(iface_info_t *iface, const char *packet, int len)
+{
+	struct sockaddr_ll addr;
+	memset(&addr, 0, sizeof(struct sockaddr_ll));
+	addr.sll_family   = AF_PACKET;
+	addr.sll_ifindex  = iface->index;
+	addr.sll_halen    = ETH_ALEN;
+	addr.sll_protocol = htons(ETH_P_ARP);
+	struct ether_header *eh = (struct ether_header *)packet;
+	memcpy(addr.sll_addr, eh->ether_dhost, ETH_ALEN);
+
+	if (sendto(iface->fd, packet, len, 0, (const struct sockaddr *)&addr,
+				sizeof(struct sockaddr_ll)) < 0) {
+		perror("Send raw packet failed");
+	}
+}
+```
+
+主循环的关键部分如下，它保证“收到一个包、处理一个包”，并在处理完成后释放 `packet` 的内存：
+
+```c
+while (1) {
+	int ready = poll(instance->fds, instance->nifs, -1);
+	...
+	for (int i = 0; i < instance->nifs; i++) {
+		if (instance->fds[i].revents & POLLIN) {
+			len = recvfrom(instance->fds[i].fd, buf, ETH_FRAME_LEN, 0, ...);
+			...
+			else {
+				iface_info_t *iface = fd_to_iface(instance->fds[i].fd);
+				...
+				char *packet = malloc(len);
+				memcpy(packet, buf, len);
+				handle_packet(iface, packet, len);
+			}
+		}
+	}
+}
+```
+
+Hub 与 Switch 的区别集中在 `handle_packet()`：Hub 对任何帧都广播，Switch 先查 MAC 地址表再决定转发还是广播。
+
+### 2.3 三节点拓扑
+
+集线器与交换机两部分都使用 `three_nodes_bw.py` 描述的三节点带带宽拓扑：
+
+![三节点带带宽拓扑](figures/topology_three_nodes.png)
+
+```text
+h1（10.0.0.1）── 20 Mbit/s ──┐
+h2（10.0.0.2）── 10 Mbit/s ──┼── b1 / s1
+h3（10.0.0.3）── 10 Mbit/s ──┘
+```
+
+链路带宽分别如下：`h1` 的接入链路为 20 Mbit/s，`h2`、`h3` 的接入链路各为 10 Mbit/s。
+
+## 三、集线器（Hub）的实现与验证
+
+### 3.1 `broadcast_packet()` 的实现
+
+集线器工作在物理层，它不理解 MAC 地址，只负责把从一个端口收到的信号复制到其余所有端口：
+
+```c
+// the memory of ``packet'' will be free'd in handle_packet().
+void broadcast_packet(iface_info_t *iface, const char *packet, int len)
+{
+	iface_info_t *entry;
+	list_for_each_entry(entry, &(instance->iface_list), list)	// defined in include/list.h
+	{
+		if (entry->index != iface->index)
+		{
+			iface_send_packet(entry, packet, len);
+		}
+	}
+}
+```
+
+实现要点：
+
+- `list_for_each_entry` 是框架提供的链表遍历宏，它通过 `offsetof` 从内嵌的 `struct list_head` 反推出 `iface_info_t` 的地址。
+- 判断“是否是接收接口”使用 `entry->index`（内核接口编号），他是内核对接口的唯一编号，并且生命周期覆盖整个运行周期。
+
+### 3.2 连通性验证
+
+在 Mininet 中为 b1 启动 `./hub` 后进行连通性测试：
+
+```text
+mininet> xterm b1
+mininet> pingall
+*** Ping: testing ping reachability
+b1 -> X X X 
+h1 -> *** Error: could not parse ping output: ping: None: Temporary failure in name resolution
+
+X h2 h3 
+h2 -> *** Error: could not parse ping output: ping: None: Temporary failure in name resolution
+
+X h1 h3 
+h3 -> *** Error: could not parse ping output: ping: None: Temporary failure in name resolution
+
+X h1 h2 
+*** Results: 50% dropped (6/12 received)
+mininet> h1 ping h2 -c 2
+PING 10.0.0.2 (10.0.0.2) 56(84) bytes of data.
+64 bytes from 10.0.0.2: icmp_seq=1 ttl=64 time=0.060 ms
+64 bytes from 10.0.0.2: icmp_seq=2 ttl=64 time=0.344 ms
+
+--- 10.0.0.2 ping statistics ---
+2 packets transmitted, 2 received, 0% packet loss, time 1123ms
+rtt min/avg/max/mdev = 0.060/0.202/0.344/0.142 ms
+mininet> h1 ping h3 -c 2
+...
+64 bytes from 10.0.0.3: icmp_seq=1 ttl=64 time=0.132 ms
+64 bytes from 10.0.0.3: icmp_seq=2 ttl=64 time=0.093 ms
+rtt min/avg/max/mdev = 0.093/0.112/0.132/0.019 ms
+mininet> h3 ping h2 -c 2
+...
+64 bytes from 10.0.0.2: icmp_seq=1 ttl=64 time=0.054 ms
+64 bytes from 10.0.0.2: icmp_seq=2 ttl=64 time=0.070 ms
+rtt min/avg/max/mdev = 0.054/0.062/0.070/0.008 ms
+```
+
+`pingall` 只有指向 `b1` 的几处失败。原因是 `b1` 作为二层设备没有配置 IP 地址，Mininet 的 `pingall` 仍然尝试 ping 它的 IP，于是得到 `Temporary failure in name resolution`，这是预期行为。
+
+三个端节点之间的往返时延汇总如下：
+
+| 方向 | min RTT | avg RTT | max RTT | 丢包 |
+| --- | ---: | ---: | ---: | ---: |
+| h1 → h2 | 0.060 ms | 0.202 ms | 0.344 ms | 0% |
+| h1 → h3 | 0.093 ms | 0.112 ms | 0.132 ms | 0% |
+| h3 → h2 | 0.054 ms | 0.062 ms | 0.070 ms | 0% |
+
+时延都在亚毫秒级，说明虚拟链路上的广播转发路径通畅。
+
+### 3.3 广播网络的效率测量
+
+在 `three_nodes_bw.py` 上使用 `iperf` 测量两种场景：
+
+- **场景 A（H1 为发送端）**：`H1` 同时作为 client 向 `H2`、`H3` 两个 server 发送数据；
+- **场景 B（H1 为接收端）**：`H1` 作为 server，`H2`、`H3` 两个 client 同时向 `H1` 发送数据。
+
+场景 A 与场景 B 的原始日志如下（每段测试 30 秒，TCP 端口 5001，窗口 85.3 KByte）：
+
+```bash
+# 场景 A
+iperf -c 10.0.0.2 -t 30 & iperf -c 10.0.0.3 -t 30
+[1] 61416
+------------------------------------------------------------
+Client connecting to 10.0.0.3, TCP port 5001
+Client connecting to 10.0.0.2, TCP port 5001
+TCP window size: 85.3 KByte (default)TCP window size: 85.3 KByte (default)
+------------------------------------------------------------
+[  1] local 10.0.0.1 port 52310 connected with 10.0.0.3 port 5001 (icwnd/mss/irtt=14/1448/253)
+[  1] local 10.0.0.1 port 42300 connected with 10.0.0.2 port 5001 (icwnd/mss/irtt=14/1448/300)
+[ ID] Interval       Transfer     Bandwidth
+[  1] 0.0000-30.4909 sec  21.3 MBytes  5.85 Mbits/sec
+[  1] 0.0000-30.8921 sec  11.0 MBytes  2.99 Mbits/sec
+```
+
+```bash
+# 场景 B
+iperf -s
+------------------------------------------------------------
+Server listening on TCP port 5001
+TCP window size: 85.3 KByte (default)
+------------------------------------------------------------
+[  1] local 10.0.0.1 port 5001 connected with 10.0.0.3 port 35392 (icwnd/mss/irtt=14/1448/140)
+[  2] local 10.0.0.1 port 5001 connected with 10.0.0.2 port 44322 (icwnd/mss/irtt=14/1448/21686)
+[ ID] Interval       Transfer     Bandwidth
+[  1] 0.0000-30.8588 sec  30.4 MBytes  8.26 Mbits/sec
+[  2] 0.0000-30.6453 sec  30.6 MBytes  8.38 Mbits/sec
+```
+
+整理成表格：
+
+| 场景 | 数据流 | 传输量 | 时长 | 吞吐 | 合计 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| A | 流 1 | 21.3 MB | 30.49 s | 5.85 Mbit/s | **8.84 Mbit/s** |
+|   | 流 2 | 11.0 MB | 30.89 s | 2.99 Mbit/s |  |
+| B | H2 → H1 | 30.6 MB | 30.65 s | 8.38 Mbit/s | **16.64 Mbit/s** |
+|   | H3 → H1 | 30.4 MB | 30.86 s | 8.26 Mbit/s |  |
+
+可以看到两个明显现象：
+
+1. **场景 A 的合计吞吐（8.84 Mbit/s）只有场景 B（16.64 Mbit/s）的约 53%**，广播网络在“一个节点同时发给两个节点”时效率明显更差。
+2. **同为发送端，两条流的带宽分配严重不均**：一条得到 5.85 Mbit/s，另一条只有 2.99 Mbit/s，接近 2:1。
+
+原因在第五章结合交换机结果一起分析。
+
+### 3.4 环形拓扑下的广播环路
+
+#### (1) 环形拓扑的构造
+
+`ring_topo.py` 在实验一的框架上增加了第三个 Hub `b3`，让 `b1` 与 `b2` 之间同时存在两条路径：一条是直连的 `b1—b2`，另一条是绕行 `b1—b3—b2`。于是三台 Hub 与链路一起构成了一个物理环路：
+
+![环形拓扑：三台 Hub 之间的环路](figures/topology_ring.png)
+
+```python
+#            h1 --- b1 --- b2 --- h2
+#                    \     /
+#                     \   /
+#                      b3
+#
+# b1 和 b2 之间有两条路：直连的 b1--b2，以及绕行的 b1--b3--b2。
+# 三台 hub 一起跑起来之后，一个广播帧会沿着 b1->b2->b3->b1 永远转圈，
+# 而且每经过一个 hub 就被复制一份。
+class RingTopo(Topo):
+    def build(self):
+        h1 = self.addHost('h1')
+        h2 = self.addHost('h2')
+        b1 = self.addHost('b1')
+        b2 = self.addHost('b2')
+        b3 = self.addHost('b3')
+
+        self.addLink(h1, b1, bw=20)     # h1-eth0  <-> b1-eth0
+        self.addLink(b1, b2, bw=10)     # b1-eth1  <-> b2-eth0
+        self.addLink(b2, h2, bw=20)     # b2-eth1  <-> h2-eth0
+        self.addLink(b1, b3, bw=10)     # b1-eth2  <-> b3-eth0   ┐
+        self.addLink(b3, b2, bw=10)     # b3-eth1  <-> b2-eth2   ┘ 环路: 绕行那条
+```
+
+接口分布如下：
+
+```text
+b1: eth0->h1   eth1->b2   eth2->b3
+b2: eth0->b1   eth1->h2   eth2->b3
+b3: eth0->b1   eth1->b2
+```
+
+#### (2) 环路抓包与统计
+
+在环形拓扑上执行一次 `ping -c 1`，并在 `h1-eth0` 上抓包，得到结果整理如下：
+
+| 项目 | 数值 |
+| --- | --- |
+| 抓包接口 | `h1-eth0` |
+| 抓包工具 | Dumpcap (Wireshark) 4.2.2 |
+| 数据包数 | 206,188 |
+| 抓包时长 | 6.245751322 s |
+| 总数据量 | 约 15 MB |
+| 平均包长 | 74.91 Byte |
+| 平均包速率 | 33,012 packet/s（33 kpps） |
+| 平均码率 | 19.78 Mbit/s |
+
+| 指标 | 数值 |
+| --- | ---: |
+| 帧总数 | 206,188 |
+| **不重复帧数** | **487** |
+| **放大倍数（总帧数 / 不重复帧数）** | **423.4×** |
+| ARP 帧 | 85,014（41.2%） |
+| ICMP Echo Reply 帧 | 120,691（58.5%） |
+| ICMP Echo Request 帧 | 483（0.2%） |
+| 不重复的 Echo Request（按 id + seq） | **1** |
+| ARP 请求 / ARP 应答 | 350 / 84,664 |
+| IP 方向统计 | h1→h2：483；h2→h1：120,691 |
+
+![广播风暴中的帧类型构成](figures/ring_frame_composition.png)
+
+![环形拓扑下广播风暴的速率与吞吐随时间变化](figures/ring_broadcast_storm_timeseries.png)
+
+![广播风暴中的帧长分布](figures/ring_frame_sizes.png)
+
+#### (3) 现象解释
+
+一个**只发了一次**的 ICMP Echo Request，在 6.2 秒的抓包里出现了 483 次，并且 487 个不重复帧被复制成了 206,188 个帧，放大 423 倍，速率稳定在约 33 kpps、19.8 Mbit/s，直到抓包结束都没有衰减。这正是“广播环路”造成“广播风暴”的典型表现，其形成机制是：
+
+1. **Hub 没有学习能力**。`broadcast_packet()` 对任何帧都从其余所有接口发出，因此一个帧进入环路后不会被“记住方向”而被丢弃。
+2. **环路上存在两条路径**。`b1—b2` 直连与 `b1—b3—b2` 绕行让同一个帧可以沿两个方向同时前进；每经过一个 Hub 就被复制一份，于是帧的数量按回路不断翻倍。
+3. **二层转发没有 TTL 机制**。以太网帧头没有类似 IP TTL 的跳数限制，交换机/Hub 也不会递减任何计数，因此帧不会“过期”。
+4. **没有生成树协议（STP）**。真实交换机会通过 STP 在逻辑上阻塞冗余链路、消除环路，而本实验的 Hub 只做无条件复制。
+
+抓包还给出了两个特征：
+
+- Echo Request 只有 **1 个不重复签名**，却出现 483 次，说明这 483 个请求其实是**同一份帧在环路中的副本**；`h2` 每收到一份副本就回一个应答，于是产生了 120,691 个 Echo Reply。一次 ping 变成了双方共同参与的指数级放大。
+- IP 方向统计出现严重不对称：`h1→h2` 只有 483 个请求，而 `h2→h1` 有 120,691 个应答。应答本身也在环路中不断复制，并且因为目的地址是 `h1`，其中相当一部分副本最终被送到 `h1` 的链路上，`h1` 因此反复收到同一次 ping 的重复应答。
+
+从时间序列看，包速率与吞吐在整个抓包窗口内几乎保持在 20 Mbit/s 的平台上：`h1-eth0` 的链路容量恰好是 20 Mbit/s，说明**广播风暴已经把 `h1` 的接入链路完全占满**，可用于正常通信的带宽接近于零。值得注意的是，抓包中的帧长只有 98 Byte（ICMP，121,174 帧）和 42 Byte（ARP，85,014 帧）两种，风暴中几乎没有大帧，却仍然能把链路塞满，可见环路对带宽的消耗有多么迅速。
+
+## 四、交换机（Switch）的实现
+
+交换机的核心是“自学习 + 定向转发”：维护一张“MAC 地址 → 接口”的映射表，收到帧后先按目的 MAC 查表，查到就从对应接口转发，查不到才广播；同时把帧的源 MAC 与接收接口登记到表中，并周期性地清除长期不用的表项。
+
+### 4.1 数据结构与哈希
+
+```c
+#define MAC_PORT_TIMEOUT 30
+
+struct mac_port_entry {
+	struct list_head list;
+	uint8_t mac[ETH_ALEN];
+	iface_info_t *iface;
+	time_t visited;
+};
+
+typedef struct {
+	struct list_head hash_table[HASH_8BITS];
+	pthread_mutex_t lock;
+	pthread_t thread;
+} mac_port_map_t;
+```
+
+MAC 地址表被组织成 256 个桶的哈希表（`HASH_8BITS = 256`），每个桶是一条链表，表项记录 MAC、出接口和最近一次访问时间 `visited`。哈希函数直接复用框架提供的 `hash8()`（逐字节异或）：
+
+```c
+static inline u8 hash8(char *buf, int len)
+{
+	u8 result = 0;
+	for (int i = 0; i < len; i++)
+		result ^= buf[i];
+
+	return result;
+}
+```
+
+在此基础上定义两个宏，使后续代码更易读：
+
+```c
+// hash: u8 mac[ETH_ALEN] -> HASH_8BITS
+#define mac_to_addr_8(mac) (hash8((char *)(mac), ETH_ALEN))
+
+// check if two mac addrs are equal
+#define mac_equal(mac1, mac2) (memcmp((mac1), (mac2), ETH_ALEN) == 0)
+```
+
+### 4.2 `lookup_port()`：查找出接口
+
+```c
+iface_info_t *lookup_port(u8 mac[ETH_ALEN])
+{
+	u8 hash_mac = mac_to_addr_8(mac);
+	iface_info_t* iface = NULL;
+
+	pthread_mutex_lock(& mac_port_map.lock);
+	mac_port_entry_t *entry;
+	list_for_each_entry(entry, & mac_port_map.hash_table[hash_mac], list)
+	{
+		if (mac_equal(mac, entry->mac)) 
+		{
+			iface = entry->iface;
+			entry->visited = time(NULL);
+			break;
+		}
+	}
+	pthread_mutex_unlock(&mac_port_map.lock);
+
+	return iface;
+}
+```
+
+函数先算出桶号，只遍历该桶；命中后返回出接口，并**顺手把 `visited` 更新为当前时间**。这一点很重要：只要某个 MAC 还在参与通信，它的表项就会不断被刷新，不会被老化线程误删。查不到时返回 `NULL`，由上层决定改用广播。
+
+### 4.3 `insert_mac_port()`：学习源 MAC
+
+```c
+void insert_mac_port(u8 mac[ETH_ALEN], iface_info_t *iface)
+{
+	u8 hash_mac = mac_to_addr_8(mac);
+
+	pthread_mutex_lock(& mac_port_map.lock);
+	mac_port_entry_t *entry;
+	list_for_each_entry(entry, & mac_port_map.hash_table[hash_mac], list)
+	{
+		if (mac_equal(mac, entry->mac)) 
+		{
+			list_delete_entry(& entry->list);
+			entry->iface = iface;
+			entry->visited = time(NULL);
+			list_add_head(& entry->list, & mac_port_map.hash_table[hash_mac]);
+			pthread_mutex_unlock(&mac_port_map.lock);
+			return;
+		}
+	}
+	mac_port_entry_t *new = malloc (sizeof (mac_port_entry_t));
+	if (!new) { pthread_mutex_unlock(& mac_port_map.lock); return; }
+
+	memcpy(new->mac, mac, ETH_ALEN);
+	new->iface = iface;
+	new->visited = time(NULL);
+	list_add_head(& new->list, & mac_port_map.hash_table[hash_mac]);
+	pthread_mutex_unlock(& mac_port_map.lock);
+}
+```
+
+处理逻辑分两种情况：
+
+- **表项已存在**：无论是否有接口变化（因为更新接口开销实际并不大，不会形成瓶颈），先把它从原链表位置摘下，更新出接口和时间后重新插入到桶头。这里在 `list_for_each_entry` 中删除并立即 `return`，不会继续遍历被修改的链表，因此无需使用 safe 版本。
+- **表项不存在**：`malloc` 一个新表项，填入 MAC、出接口和时间，插入桶头。`malloc` 失败时只解锁并返回，不影响后续转发——学习失败最多让下一帧继续广播，不会造成崩溃。
+
+新表项插入桶头（`list_add_head`）而不是桶尾，是因为活跃表项会被反复刷新并移到桶头，长期不用的表项自然沉到桶尾，链表局部性更好。
+
+### 4.4 `sweep_aged_mac_port_entry()`：老化清除
+
+```c
+int sweep_aged_mac_port_entry()
+{
+	int count = 0;
+	time_t now = time(NULL);
+
+	pthread_mutex_lock(&mac_port_map.lock);
+	mac_port_entry_t *entry, *q;
+	
+	for (int i = 0; i < HASH_8BITS; i++) 
+	{
+		list_for_each_entry_safe(entry, q, &mac_port_map.hash_table[i], list) 
+		{
+			if (difftime(now, entry->visited) >= MAC_PORT_TIMEOUT)
+			{
+				list_delete_entry(&entry->list);
+				free(entry);
+				count ++;
+			}
+		}
+	}
+
+	pthread_mutex_unlock(&mac_port_map.lock);
+	return count;
+}
+```
+
+由于遍历过程中会删除并释放当前节点，必须使用 `list_for_each_entry_safe`。函数返回本次删除的表项数量，供调用者记录日志。
+
+老化线程每秒执行一次清除：
+
+```c
+void *sweeping_mac_port_thread(void *nil)
+{
+	while (1) {
+		sleep(1);
+		int n = sweep_aged_mac_port_entry();
+
+		if (n > 0)
+			log(DEBUG, "%d aged entries in mac_port table are removed.", n);
+	}
+
+	return NULL;
+}
+```
+
+定期老化可以解决两类问题：一是主机下线后表项永久占用内存；二是主机更换接口时，若旧表项还在，会短时间把帧错误转发到旧端口。30 秒超时是“及时性”与“稳定性”之间的折中。
+
+### 4.5 `handle_packet()`：转发与广播
+
+```c
+void handle_packet(iface_info_t *iface, char *packet, int len)
+{
+	struct ether_header *eh = (struct ether_header *)packet;
+
+	iface_info_t *out = lookup_port(eh->ether_dhost);
+    if (out)
+        iface_send_packet(out, packet, len);        // send to dst
+    else
+        broadcast_packet(iface, packet, len);       // broadcast
+
+    insert_mac_port(eh->ether_shost, iface);
+	
+	free(packet);
+}
+```
+
+这是交换机的数据平面，三步顺序与实验注释完全对应：
+
+1. **查表转发**：以目的 MAC 查表。查到则直接单播到对应接口，不再打扰其他端口；查不到（未知单播）或目的地址是广播/组播地址时，调用 `broadcast_packet()` 从其余接口泛洪。
+2. **学习源地址**：把源 MAC 与接收接口写入表中。注意必须在转发之后学习，避免把本帧的源地址立刻用于本帧的回环判定——本框架中同一帧不会被发回接收接口，顺序其实不影响正确性，但“先转发、后学习”更符合标准交换机的处理流程。
+3. **释放内存**：框架在收到帧时 `malloc`，处理完毕后由 `handle_packet()` 统一 `free()`，`broadcast_packet()` 只借用缓冲区。
+
+交换机的 `broadcast_packet()` 与 Hub 的完全一致，只是当 MAC 表命中时它不会再被调用，因此泛洪只发生在网络启动初期、表项老化之后或真正的广播帧上：
+
+```c
+void broadcast_packet(iface_info_t *iface, const char *packet, int len)
+{
+	iface_info_t *entry;
+	list_for_each_entry(entry, &(instance->iface_list), list)
+	{
+		if (entry->index != iface->index)
+		{
+			iface_send_packet(entry, packet, len);
+		}
+	}
+}
+```
+
+### 4.6 连通性与性能验证
+
+交换机版本的连通性测试结果：
+
+```text
+mininet> pingall
+*** Ping: testing ping reachability
+h1 -> h2 h3 X 
+h2 -> h1 h3 X 
+h3 -> h1 h2 X 
+s1 -> X X X 
+*** Results: 50% dropped (6/12 received)
+```
+
+与 Hub 相同，6 个端节点互 ping 全部成功，失败的 6 个方向都是指向没有 IP 的 `s1`。
+
+性能测量使用与 Hub 完全相同的拓扑和命令，得到：
+
+```bash
+# 场景 A：h1 中执行 iperf -c 10.0.0.2 -t 30 & iperf -c 10.0.0.3 -t 30
+[  1] local 10.0.0.1 port 51462 connected with 10.0.0.2 port 5001 (icwnd/mss/irtt=14/1448/166)
+[  1] local 10.0.0.1 port 55418 connected with 10.0.0.3 port 5001 (icwnd/mss/irtt=14/1448/118)
+[ ID] Interval       Transfer     Bandwidth
+[  1] 0.0000-31.0876 sec  34.8 MBytes  9.38 Mbits/sec
+[  1] 0.0000-31.2286 sec  35.0 MBytes  9.40 Mbits/sec
+```
+
+```bash
+# 场景 B：h1 中执行 iperf -s，h2、h3 中分别执行 iperf -c 10.0.0.1 -t 30
+[  1] local 10.0.0.1 port 5001 connected with 10.0.0.2 port 42756 (icwnd/mss/irtt=14/1448/28)
+[  2] local 10.0.0.1 port 5001 connected with 10.0.0.3 port 39966 (icwnd/mss/irtt=14/1448/49)
+[ ID] Interval       Transfer     Bandwidth
+[  1] 0.0000-31.0278 sec  34.4 MBytes  9.29 Mbits/sec
+[  2] 0.0000-30.9100 sec  34.3 MBytes  9.30 Mbits/sec
+```
+
+| 场景 | 数据流 | 传输量 | 时长 | 吞吐 | 合计 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| A | 流 1 | 34.8 MB | 31.09 s | 9.38 Mbit/s | **18.78 Mbit/s** |
+| A | 流 2 | 35.0 MB | 31.23 s | 9.40 Mbit/s |  |
+| B | H2 → H1 | 34.4 MB | 31.03 s | 9.29 Mbit/s | **18.59 Mbit/s** |
+| B | H3 → H1 | 34.3 MB | 30.91 s | 9.30 Mbit/s |  |
+
+交换机下两种场景的合计吞吐几乎相同（18.78 与 18.59），且每条流都接近各自 10 Mbit/s 接入链路的理论上限，两条流的分配也非常均匀。
+
+## 五、性能对比与分析
+
+### 5.1 结果汇总
+
+![集线器与交换机在两种场景下的分场景吞吐](figures/perf_hub_vs_switch.png)
+
+![合计吞吐与提速倍数](figures/perf_aggregate_speedup.png)
+
+| 场景 | 数据流 | Hub | Switch | Switch / Hub |
+| --- | --- | ---: | ---: | ---: |
+| A | 流 1 | 5.85 | 9.38 | 1.60× |
+| A | 流 2 | 2.99 | 9.40 | 3.14× |
+| A | **合计** | **8.84** | **18.78** | **2.12×** |
+| B | H2 → H1 | 8.38 | 9.29 | 1.11× |
+| B | H3 → H1 | 8.26 | 9.30 | 1.13× |
+| B | **合计** | **16.64** | **18.59** | **1.12×** |
+
+换算成对 `h1` 接入链路（20 Mbit/s）的利用率：
+
+| 指标 | Hub | Switch |
+| --- | ---: | ---: |
+| 场景 A 合计吞吐 / H1 链路容量 | 44.2% | 93.9% |
+| 场景 B 合计吞吐 / H1 链路容量 | 83.2% | 93.0% |
+| 场景 B 与场景 A 的合计之比 | 1.88 | 0.99 |
+
+### 5.2 场景 A 差异分析：泛洪让下行链路被两条流共享
+
+场景 A 中 `H1` 同时向 `H2`、`H3` 发送数据。对 **Hub** 而言，`broadcast_packet()` 将每个帧发送给所有非传入端口的端口，因此：
+
+- `H1 → H2` 的数据帧不仅出现在 `H2` 的 10 Mbit/s 链路上，也被复制到 `H3` 的 10 Mbit/s 链路上；
+- 同理，`H1 → H3` 的数据帧也出现在 `H2` 的链路上。
+
+也就是说，**每一条 10 Mbit/s 的下行接入链路都要同时承载两条流的数据**，其带宽上限直接决定了“两条流之和”的上限。两条流合计 8.84 Mbit/s，已接近 10 Mbit/s 链路在扣除 TCP 首部与 ACK 之后的有效容量，这正是 Hub 场景 A 只能跑到约 8.8 Mbit/s 的原因。同时，因为两条流共享同一条受限链路，TCP 的竞争使带宽分配失衡，出现了 5.85 : 2.99 的不公平划分。
+
+对 **Switch** 而言，转发大部分时间 `lookup_port()` 命中，数据帧只会送到目的主机所在的接口：`H1 → H2` 只走 `H2` 的链路，`H1 → H3` 只走 `H3` 的链路。因此每条 10 Mbit/s 链路只承载一条流，各自可以跑满约 9.4 Mbit/s；而两条流之和 18.78 Mbit/s 已经接近 `H1` 的 20 Mbit/s 链路容量（93.9%）。场景 A 的提升倍数达到 **2.12×**，本质是“把被泛洪浪费掉的另一条下行链路还给了用户”。
+
+### 5.3 场景 B 差异分析：泛洪副本落在空闲方向上
+
+场景 B 中 `H2`、`H3` 同时向 `H1` 发送数据，此时：
+
+- 每个发送方的**上行方向**只承载自己的数据，Hub 的复制副本落到的是另一台主机的**下行方向**，与发送方的上行方向互不争用；
+- 接收方 `H1` 的链路容量为 20 Mbit/s，两条流合计 16.64 Mbit/s 仍在容量之内。
+
+因此 Hub 在场景 B 下没有被“下游共享”直接卡死，实测 16.64 Mbit/s，与 Switch 的 18.59 Mbit/s 只差约 11%。这 11% 的差距来自泛洪本身的代价：Hub 需要为每个帧额外复制、发送一份到无关主机，占用了一份额外的链路与转发开销（交换机只需发送一次），同时无关主机的协议栈也在处理本不属于自己的数据。Switch 侧因为每个帧只发送一次，两条流都能各自跑满约 9.3 Mbit/s。
+
+### 5.4 广播网络的对称性差异
+
+把两种场景放在一起看，可以得到一个更直观的结论：
+
+- **交换机是对称的**：场景 A 18.78 Mbit/s，场景 B 18.59 Mbit/s，两者之比 0.99。这是因为转发路径与“谁是发送方”无关，每条流的路径都是“源接入链路 → s1 → 目的接入链路”，与拓扑完全对称。
+- **集线器是明显不对称的**：场景 B 是场景 A 的 1.88 倍。因为 Hub 的性能取决于“广播副本落在哪里”：当副本落在已经被占用的下行链路时（场景 A），性能损失巨大；当副本恰好落在空闲方向时（场景 B），损失就小得多。这也指出了 Hub 的吞吐与流量方向紧密相关。
+
+## 六、实验总结
+
+本实验完成了广播网络与交换式网络两种用户态二层设备的实现：
+
+1. **Hub**：`broadcast_packet()` 通过遍历接口链表、排除接收接口，实现了从所有其他端口复制转发。环形拓扑实验定量地展示了缺少学习与环路控制的后果。
+2. **Switch**：实现了基于 256 桶哈希表的 MAC 地址表，`lookup_port()` 查找并按访问时间刷新、`insert_mac_port()` 学习并更新源地址、`sweep_aged_mac_port_entry()` 每 30 秒清除老化表项，`handle_packet()` 完成“命中单播、未命中泛洪、随后学习”的完整转发流程；数据平面与老化线程之间用互斥锁保证线程安全，销毁时先停线程再释放资源。
+3. **性能对比**：在完全相同的拓扑与命令下，交换机的合计吞吐为 18.78 / 18.59 Mbit/s（场景 A / B），接近 `h1` 链路 20 Mbit/s 容量的 94%；集线器只有 8.84 / 16.64 Mbit/s，分别为 44% 和 83%。**场景 A 提升 2.12 倍，场景 B 提升 1.12 倍。**
+
+实验指出集线器对每个帧无条件复制到所有其他端口，导致多个流共享同一条下行链路并浪费带宽；交换机通过 MAC 地址学习把单播帧只送到目的端口，让每条流独享自己的链路。实验也说明，二层网络若要引入冗余链路提高可靠性，就必须用 STP 之类的机制消除环路，否则广播帧会立刻演化为风暴。
