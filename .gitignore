@@ -1,3 +1,10 @@
+*[!.]*
+!*.*
+!Makefile
+!Dockerfile
+!README
+!LICENSE
+
 .venv/
 __pycache__/
 *.mmdb
@@ -8,3 +15,5 @@ build/
 keys/
 *.o
 .vscode/
+*.arm
+*.32
