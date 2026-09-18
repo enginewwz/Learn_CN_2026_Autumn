@@ -6,3 +6,4 @@ sites.csv
 *.png
 build/
 keys/
+*.o
