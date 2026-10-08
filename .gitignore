@@ -1,9 +1,4 @@
-*[!.]*
-!*.*
-!Makefile
-!Dockerfile
-!README
-!LICENSE
+*reference
 
 .venv/
 __pycache__/
