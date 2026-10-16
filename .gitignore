@@ -12,3 +12,9 @@ keys/
 .vscode/
 *.arm
 *.32
+
+*.tex
+*.md
+*.txt
+*.csv
+*.log
