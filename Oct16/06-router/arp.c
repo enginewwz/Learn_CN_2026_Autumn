@@ -14,19 +14,78 @@
 // iface_send_packet
 void arp_send_request(iface_info_t *iface, u32 dst_ip)
 {
-	fprintf(stderr, "TODO: send arp request when lookup failed in arpcache.\n");
+	int len = ETHER_HDR_SIZE + sizeof(struct ether_arp);
+	char *packet = (char *)malloc(len);
+
+	struct ether_header *eh = (struct ether_header *)packet;
+	memset(eh->ether_dhost, 0xff, ETH_ALEN);	// broadcast
+	memcpy(eh->ether_shost, iface->mac, ETH_ALEN);
+	eh->ether_type = htons(ETH_P_ARP);
+
+	struct ether_arp *arp = (struct ether_arp *)(packet + ETHER_HDR_SIZE);
+	arp->arp_hrd = htons(ARPHRD_ETHER);
+	arp->arp_pro = htons(ETH_P_IP);
+	arp->arp_hln = ETH_ALEN;
+	arp->arp_pln = 4;
+	arp->arp_op  = htons(ARPOP_REQUEST);
+	memcpy(arp->arp_sha, iface->mac, ETH_ALEN);
+	arp->arp_spa = htonl(iface->ip);
+	memset(arp->arp_tha, 0, ETH_ALEN);
+	arp->arp_tpa = htonl(dst_ip);
+
+	iface_send_packet(iface, packet, len);	// free packet itself
 }
 
 // send an arp reply packet: encapsulate an arp reply packet, send it out
 // through iface_send_packet
 void arp_send_reply(iface_info_t *iface, struct ether_arp *req_hdr)
 {
-	fprintf(stderr, "TODO: send arp reply when receiving arp request.\n");
+	int len = ETHER_HDR_SIZE + sizeof(struct ether_arp);
+	char *packet = (char *)malloc(len);
+
+	struct ether_header *eh = (struct ether_header *)packet;
+	memcpy(eh->ether_dhost, req_hdr->arp_sha, ETH_ALEN);
+	memcpy(eh->ether_shost, iface->mac, ETH_ALEN);
+	eh->ether_type = htons(ETH_P_ARP);
+
+	struct ether_arp *arp = (struct ether_arp *)(packet + ETHER_HDR_SIZE);
+	arp->arp_hrd = htons(ARPHRD_ETHER);
+	arp->arp_pro = htons(ETH_P_IP);
+	arp->arp_hln = ETH_ALEN;
+	arp->arp_pln = 4;
+	arp->arp_op  = htons(ARPOP_REPLY);
+	memcpy(arp->arp_sha, iface->mac, ETH_ALEN);
+	arp->arp_spa = htonl(iface->ip);
+	memcpy(arp->arp_tha, req_hdr->arp_sha, ETH_ALEN);
+	arp->arp_tpa = req_hdr->arp_spa;
+
+	iface_send_packet(iface, packet, len);
 }
 
 void handle_arp_packet(iface_info_t *iface, char *packet, int len)
 {
-	fprintf(stderr, "TODO: process arp packet: arp request & arp reply.\n");
+	if (len < ETHER_HDR_SIZE + (int)sizeof(struct ether_arp)) 
+	{
+		free(packet);
+		return;
+	}
+
+	struct ether_arp *arp = (struct ether_arp *)(packet + ETHER_HDR_SIZE);
+
+	if (ntohs(arp->arp_op) == ARPOP_REQUEST) 
+	{
+		if (ntohl(arp->arp_tpa) == iface->ip) 
+		{
+			arp_send_reply(iface, arp);
+			arpcache_insert(ntohl(arp->arp_spa), arp->arp_sha);
+		}
+	}
+	else if (ntohs(arp->arp_op) == ARPOP_REPLY) 
+	{
+		arpcache_insert(ntohl(arp->arp_spa), arp->arp_sha);
+	}
+
+	free(packet);
 }
 
 // send (IP) packet through arpcache lookup 
