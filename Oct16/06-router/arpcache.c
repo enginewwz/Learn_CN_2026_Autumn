@@ -207,7 +207,7 @@ void *arpcache_sweep(void *arg)
 			}
 			else
 			{
-				if (difftime(cur_time, req_entry->sent) > 1)
+				if (difftime(cur_time, req_entry->sent) >= 1)
 				{
 					arp_send_request(req_entry->iface, req_entry->ip4);
 					req_entry->sent = time(NULL);
