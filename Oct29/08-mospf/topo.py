@@ -1,5 +1,7 @@
 #!/usr/bin/python
 
+from __future__ import print_function
+
 import os
 import sys
 import glob
@@ -15,7 +17,7 @@ def check_scripts():
     
     for fname in glob.glob(dir + '/' + 'scripts/*.sh'):
         if not os.access(fname, os.X_OK):
-            print '%s should be set executable by using `chmod +x $script_name`' % (fname)
+            print('%s should be set executable by using `chmod +x $script_name`' % (fname))
             sys.exit(1)
 
     for program in script_deps:
@@ -26,7 +28,7 @@ def check_scripts():
                 found = True
                 break
         if not found:
-            print '`%s` is required but missing, which could be installed via `apt` or `aptitude`' % (program)
+            print('`%s` is required but missing, which could be installed via `apt` or `aptitude`' % (program))
             sys.exit(2)
 
 class MOSPFTopo(Topo):

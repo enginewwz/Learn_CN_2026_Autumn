@@ -19,4 +19,8 @@ typedef struct {
 
 void init_mospf_db();
 
+mospf_db_entry_t *mospf_db_lookup(u32 rid);
+void mospf_db_update(u32 rid, u16 seq, int nadv, const char *lsa_raw);
+void mospf_db_dump();
+
 #endif

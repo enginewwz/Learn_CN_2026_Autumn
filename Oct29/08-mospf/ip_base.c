@@ -61,6 +61,6 @@ void ip_send_packet(char *packet, int len)
 		return;
 	}
 
-	u32 next_hop = entry->gw ? entry->gw : daddr;
+	u32 next_hop = get_next_hop(entry, daddr);
 	iface_send_packet_by_arp(entry->iface, next_hop, packet, len);
 }

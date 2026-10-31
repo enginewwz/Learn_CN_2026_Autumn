@@ -12,6 +12,31 @@
 #include <stdlib.h>
 #include <assert.h>
 
+void ip_forward_packet(u32 dst, char *packet, int len)
+{
+	struct iphdr *ip = packet_to_ip_hdr(packet);
+
+	// TTL
+	if (ip->ttl <= 1) {
+		icmp_send_packet(packet, len, ICMP_TIME_EXCEEDED, ICMP_EXC_TTL);
+		free(packet);
+		return;
+	}
+
+	ip->ttl -= 1;
+	ip->checksum = ip_checksum(ip);
+
+	rt_entry_t *entry = longest_prefix_match(dst);
+	if (!entry) {
+		icmp_send_packet(packet, len, ICMP_DEST_UNREACH, ICMP_NET_UNREACH);
+		free(packet);
+		return;
+	}
+
+	u32 next_hop = get_next_hop(entry, dst);
+	iface_send_packet_by_arp(entry->iface, next_hop, packet, len);
+}
+
 // handle ip packet
 //
 // If the packet is ICMP echo request and the destination IP address is equal to

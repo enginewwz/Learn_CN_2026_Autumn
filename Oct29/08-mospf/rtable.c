@@ -65,3 +65,8 @@ void print_rtable()
 	}
 	fprintf(stdout, "--------------------------------------\n");
 }
+
+u32 get_next_hop(rt_entry_t *entry, u32 dst)
+{
+	return entry->gw ? entry->gw : dst;
+}
