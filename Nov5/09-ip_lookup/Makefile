@@ -5,7 +5,7 @@ all: $(TARGET)
 SRCS = tree.c util.c main.c
 
 $(TARGET): $(SRCS)
-	gcc -Wall -g $(SRCS) -o $(TARGET) -I./include
+	gcc -march=native -Wall -g $(SRCS) -o $(TARGET) -I./include
 
 clean:
 	@rm $(TARGET)
